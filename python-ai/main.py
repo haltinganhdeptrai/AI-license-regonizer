@@ -74,6 +74,16 @@ def optimize_lp_image(crop_img):
     
     # Chuyển ngược lại dạng 3 kênh màu cho OCR đầu vào
     final_img = cv2.cvtColor(denoised, cv2.COLOR_GRAY2BGR)
+
+    # Bước E: Thêm viền đệm (padding) quanh ảnh — bộ phát hiện text của EasyOCR cần khoảng
+    # đệm xung quanh chữ để nhận diện vùng text; ảnh biển số bị crop sát mép (gần như chạm
+    # viền khung ảnh) rất dễ khiến EasyOCR "không thấy" chữ dù mắt người vẫn đọc được.
+    border = max(15, int(min(final_img.shape[0], final_img.shape[1]) * 0.15))
+    final_img = cv2.copyMakeBorder(
+        final_img, border, border, border, border,
+        cv2.BORDER_CONSTANT, value=(255, 255, 255)  # viền trắng, giống nền biển số thật
+    )
+
     return final_img
 
 VALID_PROVINCES = {
@@ -157,6 +167,44 @@ def read_license_plate_segments(crop):
             continue
             
     return best_raw_ocr, best_confs
+
+def merge_nearby_plate_boxes(boxes, x_overlap_ratio=0.3, y_gap_ratio=1.5):
+    """
+    Gộp các box biển số phát hiện được mà nằm sát nhau theo chiều dọc thành 1 box duy nhất.
+
+    Lý do cần hàm này: với biển số Việt Nam 2 dòng (vd: '29H' dòng trên, '555.55' dòng dưới),
+    model detect đôi khi nhận diện thành 2 box riêng biệt (do dataset train có ảnh biển 1 dòng
+    lẫn 2 dòng, hoặc annotation không đồng nhất) thay vì 1 box bao trọn cả biển. Nếu chỉ lấy
+    box điểm cao nhất (top-1), sẽ bị mất nửa biển số như trường hợp '555.55' thiếu '29H'.
+
+    boxes: list các [x1, y1, x2, y2, score, class_id] (toạ độ trong hệ quy chiếu của vehicle_crop)
+    Trả về: list box đã gộp, mỗi box vẫn giữ định dạng [x1, y1, x2, y2, score, class_id]
+    """
+    if not boxes:
+        return []
+    boxes = sorted([list(b) for b in boxes], key=lambda b: b[1])  # sắp theo y1 (trên xuống dưới)
+    merged = [boxes[0]]
+    for b in boxes[1:]:
+        cur = merged[-1]
+        cx1, cy1, cx2, cy2 = cur[0], cur[1], cur[2], cur[3]
+        bx1, by1, bx2, by2 = b[0], b[1], b[2], b[3]
+        x_overlap = max(0, min(cx2, bx2) - max(cx1, bx1))
+        min_width = min(cx2 - cx1, bx2 - bx1)
+        avg_height = ((cy2 - cy1) + (by2 - by1)) / 2
+        vertical_gap = by1 - cy2  # khoảng cách dọc giữa đáy box hiện tại và đỉnh box tiếp theo
+
+        # Gộp nếu 2 box che phủ nhau đủ nhiều theo chiều ngang (cùng thuộc 1 biển)
+        # VÀ khoảng cách dọc giữa chúng không quá xa (không phải 2 vật thể khác nhau)
+        if min_width > 0 and (x_overlap / min_width) > x_overlap_ratio and vertical_gap < avg_height * y_gap_ratio:
+            cur[0] = min(cx1, bx1)
+            cur[1] = min(cy1, by1)
+            cur[2] = max(cx2, bx2)
+            cur[3] = max(cy2, by2)
+            cur[4] = max(cur[4], b[4])  # giữ score cao hơn giữa 2 box
+        else:
+            merged.append(b)
+    return merged
+
 
 def is_box_inside(plate_box, vehicle_box):
     """
@@ -690,10 +738,14 @@ def recognize_multi():
             os.makedirs('./debug_output', exist_ok=True)
 
         # ── Bước 1: Phát hiện TẤT CẢ xe trong khung hình (không chỉ lấy 1 xe tốt nhất) ──
+        frame_area = frame_h * frame_w
         detected_vehicles = []
-        for det in coco_model(frame, verbose=False)[0].boxes.data.tolist():
+        for det in coco_model(frame, conf=0.5, verbose=False)[0].boxes.data.tolist():
             x1, y1, x2, y2, score, class_id = det
             if int(class_id) in VEHICLE_CLASSES:
+                box_area = max(0, x2 - x1) * max(0, y2 - y1)
+                if box_area < frame_area * 0.01:
+                    continue
                 v_name = VEHICLE_CLASS_NAMES.get(int(class_id), 'Vehicle')
                 detected_vehicles.append((x1, y1, x2, y2, score, v_name))
 
@@ -716,9 +768,17 @@ def recognize_multi():
             lp_score = 0.0
             if lp_model_available:
                 lp_res = lp_detector(vehicle_crop, verbose=False)[0].boxes.data.tolist()
+                lp_res = merge_nearby_plate_boxes(lp_res)  # gộp box 2 dòng bị tách rời (nếu có)
                 lp_res.sort(key=lambda x: x[4], reverse=True)
                 if lp_res:
                     lx1, ly1, lx2, ly2, lscore, _ = lp_res[0]
+                    # Nới biên nhẹ quanh box đã gộp để không cắt sát mép chữ
+                    pad_x = max(8, int((lx2 - lx1) * 0.05))
+                    pad_y = max(8, int((ly2 - ly1) * 0.08))
+                    lx1 = max(0, lx1 - pad_x)
+                    ly1 = max(0, ly1 - pad_y)
+                    lx2 = min(vehicle_crop.shape[1], lx2 + pad_x)
+                    ly2 = min(vehicle_crop.shape[0], ly2 + pad_y)
                     lp_crop = vehicle_crop[int(ly1):int(ly2), int(lx1):int(lx2)]
                     lp_score = lscore
 
@@ -731,17 +791,25 @@ def recognize_multi():
                 if lp_crop is not None and lp_crop.size > 0:
                     cv2.imwrite(f'./debug_output/vehicle_{len(results)}_plate_raw.jpg', lp_crop)
 
-            # ── Bước 3: OCR như endpoint cũ ──
+            # ── Bước 3: OCR — thử ảnh MÀU GỐC (raw) trước, processed làm dự phòng ──
             plate_text, ocr_score = None, 0.0
+
+            raw_ocr, confs = read_license_plate_segments(lp_crop) if lp_crop is not None and lp_crop.size > 0 else ([], [])
+            post_res = post_process_vietnamese_plate(raw_ocr, confs)
+
             processed = optimize_lp_image(lp_crop)
             if debug and processed is not None and processed.size > 0:
                 cv2.imwrite(f'./debug_output/vehicle_{len(results)}_plate_processed.jpg', processed)
-            if processed is not None and processed.size > 0:
-                raw_ocr, confs = read_license_plate_segments(processed)
-                post_res = post_process_vietnamese_plate(raw_ocr, confs)
-                if post_res["status"] == "success":
-                    plate_text = post_res["formatted_plate"]
-                    ocr_score = post_res["avg_conf"]
+
+            if post_res["status"] != "success" and processed is not None and processed.size > 0:
+                raw_ocr2, confs2 = read_license_plate_segments(processed)
+                post_res2 = post_process_vietnamese_plate(raw_ocr2, confs2)
+                if post_res2["status"] == "success":
+                    post_res = post_res2
+
+            if post_res["status"] == "success":
+                plate_text = post_res["formatted_plate"]
+                ocr_score = post_res["avg_conf"]
 
             results.append({
                 "vehicle_bbox": [x1, y1, x2, y2],
